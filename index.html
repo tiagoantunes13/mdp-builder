@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Multi-Grid MDP Builder</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #111827; color: #f3f4f6; font-family: sans-serif; height: 100vh; overflow: hidden; }
+  input[type=range] { cursor: pointer; }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: #1f2937; }
+  ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 2px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+const MultiGridMDP = () => {
+  const GRID_WIDTH = 20;
+  const GRID_HEIGHT = 10;
+
+  const generateMockRewards = (description) => {
+    const grid = Array(GRID_HEIGHT).fill(0).map(() => Array(GRID_WIDTH).fill(0));
+    const lower = description.toLowerCase();
+    if (lower.includes('road')) {
+      for (let i = 0; i < GRID_HEIGHT; i++) { grid[i][5] = 95; grid[i][15] = 95; }
+      for (let j = 0; j < GRID_WIDTH; j++) { grid[3][j] = 95; grid[7][j] = 95; }
+    } else if (lower.includes('beach') || lower.includes('scenic')) {
+      for (let i = 0; i < GRID_HEIGHT; i++)
+        for (let j = 0; j < GRID_WIDTH; j++)
+          grid[i][j] = Math.max(0, 100 - (i * 10));
+    } else if (lower.includes('traffic')) {
+      for (let i = 0; i < GRID_HEIGHT; i++)
+        for (let j = 0; j < GRID_WIDTH; j++) {
+          const noise = Math.random() * 30;
+          grid[i][j] = Math.max(0, Math.min(100, 100 - (Math.abs(i-5)*8 + Math.abs(j-10)*3 + noise)));
+        }
+    } else if (lower.includes('elevation') || lower.includes('terrain')) {
+      for (let i = 0; i < GRID_HEIGHT; i++)
+        for (let j = 0; j < GRID_WIDTH; j++) {
+          const d = Math.abs(i - GRID_HEIGHT/2) + Math.abs(j - GRID_WIDTH/2);
+          grid[i][j] = Math.max(20, 100 - d * 4);
+        }
+    } else if (lower.includes('safety') || lower.includes('crime')) {
+      for (let i = 0; i < GRID_HEIGHT; i++)
+        for (let j = 0; j < GRID_WIDTH; j++) {
+          const nearRoad = (Math.abs(i-3)<2||Math.abs(i-7)<2||Math.abs(j-5)<2||Math.abs(j-15)<2);
+          const inCorner = (i<2&&j<4)||(i<2&&j>15)||(i>7&&j<4)||(i>7&&j>15);
+          grid[i][j] = nearRoad ? 85 : inCorner ? 40 : 65;
+        }
+    }
+    return grid;
+  };
+
+  const [layers, setLayers] = useState([
+    { id:1, name:'Roads',       weight:0.50, description:'Highways',   rewards:generateMockRewards('roads'),   visible:true },
+    { id:2, name:'Scenic Views',weight:0.20, description:'Beach',      rewards:generateMockRewards('beach'),   visible:true },
+    { id:3, name:'Traffic',     weight:0.15, description:'Congestion', rewards:generateMockRewards('traffic'), visible:true },
+    { id:4, name:'Terrain',     weight:0.10, description:'Elevation',  rewards:generateMockRewards('terrain'), visible:true },
+    { id:5, name:'Safety',      weight:0.05, description:'Crime',      rewards:generateMockRewards('safety'),  visible:true },
+  ]);
+  const [goalCell, setGoalCell] = useState(null);
+  const [policy, setPolicy] = useState(null);
+  const [valueFunction, setValueFunction] = useState(null);
+  const [iteration, setIteration] = useState(0);
+  const [isRunning, setIsRunning] = useState(false);
+  const [hoveredLayer, setHoveredLayer] = useState(null);
+  const [converged, setConverged] = useState(false);
+  const [discount, setDiscount] = useState(0.9);
+  const [speed, setSpeed] = useState(1000);
+  const [chatInput, setChatInput] = useState('');
+  const [chatHistory, setChatHistory] = useState([
+    { role:'assistant', text:'Hello! Try: Add a parks layer with 15% weight' }
+  ]);
+  const iterationRef = useRef(null);
+
+  const calculateCombinedRewards = () => {
+    const combined = Array(GRID_HEIGHT).fill(0).map(() => Array(GRID_WIDTH).fill(0));
+    layers.filter(l => l.visible).forEach(layer => {
+      for (let i = 0; i < GRID_HEIGHT; i++)
+        for (let j = 0; j < GRID_WIDTH; j++)
+          combined[i][j] += layer.rewards[i][j] * layer.weight;
+    });
+    return combined;
+  };
+
+  const improvePolicy = (currentV, rewards, gamma) => {
+    const newPolicy = Array(GRID_HEIGHT).fill(0).map(() => Array(GRID_WIDTH).fill(null));
+    for (let i = 0; i < GRID_HEIGHT; i++) {
+      for (let j = 0; j < GRID_WIDTH; j++) {
+        if (goalCell && i === goalCell.row && j === goalCell.col) { newPolicy[i][j] = 'goal'; continue; }
+        const actions = [{di:-1,dj:0,dir:'↑'},{di:1,dj:0,dir:'↓'},{di:0,dj:-1,dir:'←'},{di:0,dj:1,dir:'→'}];
+        let bestAction = null, bestValue = -Infinity;
+        actions.forEach(action => {
+          const ni = i + action.di, nj = j + action.dj;
+          if (ni>=0&&ni<GRID_HEIGHT&&nj>=0&&nj<GRID_WIDTH) {
+            const goalReward = (goalCell && ni===goalCell.row&&nj===goalCell.col) ? 100 : 0;
+            const val = goalReward + gamma * currentV[ni][nj];
+            if (val > bestValue) { bestValue = val; bestAction = action.dir; }
+          }
+        });
+        newPolicy[i][j] = bestAction || '→';
+      }
+    }
+    return newPolicy;
+  };
+
+  const evaluatePolicy = (currentPolicy, currentV, rewards, gamma) => {
+    const newV = Array(GRID_HEIGHT).fill(0).map(() => Array(GRID_WIDTH).fill(0));
+    for (let i = 0; i < GRID_HEIGHT; i++) {
+      for (let j = 0; j < GRID_WIDTH; j++) {
+        if (goalCell && i===goalCell.row&&j===goalCell.col) { newV[i][j]=0; continue; }
+        const action = currentPolicy[i][j];
+        if (!action||action==='goal') { newV[i][j]=currentV[i][j]; continue; }
+        const m = {'↑':[-1,0],'↓':[1,0],'←':[0,-1],'→':[0,1]}[action]||[0,0];
+        const ni=i+m[0], nj=j+m[1];
+        if (ni>=0&&ni<GRID_HEIGHT&&nj>=0&&nj<GRID_WIDTH) {
+          const goalReward = (goalCell&&ni===goalCell.row&&nj===goalCell.col)?100:0;
+          newV[i][j] = goalReward + gamma * currentV[ni][nj];
+        } else newV[i][j]=currentV[i][j];
+      }
+    }
+    return newV;
+  };
+
+  const performPolicyIteration = () => {
+    if (!goalCell||converged) return;
+    const rewards = calculateCombinedRewards();
+    if (!valueFunction||!policy) {
+      const initialV = Array(GRID_HEIGHT).fill(0).map(()=>Array(GRID_WIDTH).fill(0));
+      setValueFunction(initialV);
+      setPolicy(improvePolicy(initialV, rewards, discount));
+      setIteration(1);
+      return;
+    }
+    let newV = valueFunction.map(r=>[...r]);
+    let maxDelta=Infinity, evalCount=0;
+    while (maxDelta>0.01&&evalCount<10) {
+      const updatedV = evaluatePolicy(policy, newV, rewards, discount);
+      maxDelta=0;
+      for (let i=0;i<GRID_HEIGHT;i++) for (let j=0;j<GRID_WIDTH;j++)
+        maxDelta=Math.max(maxDelta,Math.abs(updatedV[i][j]-newV[i][j]));
+      newV=updatedV; evalCount++;
+    }
+    setValueFunction(newV);
+    const newPolicy = improvePolicy(newV, rewards, discount);
+    let policyChanged=false;
+    for (let i=0;i<GRID_HEIGHT&&!policyChanged;i++)
+      for (let j=0;j<GRID_WIDTH&&!policyChanged;j++)
+        if (policy[i][j]!==newPolicy[i][j]&&newPolicy[i][j]!=='goal'&&policy[i][j]!=='goal')
+          policyChanged=true;
+    setPolicy(newPolicy);
+    setIteration(p=>p+1);
+    if (!policyChanged) { setConverged(true); setIsRunning(false); }
+  };
+
+  useEffect(() => {
+    if (isRunning&&goalCell&&!converged) {
+      iterationRef.current = setTimeout(()=>performPolicyIteration(), speed);
+    }
+    return () => { if (iterationRef.current) clearTimeout(iterationRef.current); };
+  }, [isRunning, iteration, valueFunction, policy, goalCell, discount, speed, converged]);
+
+  const handleChat = () => {
+    if (!chatInput.trim()) return;
+    const newHistory = [...chatHistory, {role:'user', text:chatInput}];
+    const lower = chatInput.toLowerCase();
+    let response = '';
+    if (lower.includes('add')&&lower.includes('layer')) {
+      const weightMatch = lower.match(/(\d+)%/);
+      const weight = weightMatch ? parseFloat(weightMatch[1])/100 : 0.1;
+      let name='Custom';
+      if (lower.includes('park')) name='Parks';
+      else if (lower.includes('residential')) name='Residential';
+      else if (lower.includes('commercial')) name='Commercial';
+      const newLayer = { id:Math.max(...layers.map(l=>l.id))+1, name, weight, description:name, rewards:generateMockRewards(name.toLowerCase()), visible:true };
+      const visibleLayers = layers.filter(l=>l.visible);
+      const totalW = visibleLayers.reduce((s,l)=>s+l.weight,0);
+      const scaleFactor = (1-weight)/totalW;
+      const adjustedLayers = layers.map(l=>({...l, weight:l.visible?l.weight*scaleFactor:l.weight}));
+      setLayers([...adjustedLayers, newLayer]);
+      response = 'Added '+name+' layer with '+Math.round(weight*100)+'% weight';
+    } else {
+      response = 'Try: Add a parks layer with 15% weight';
+    }
+    setChatHistory([...newHistory, {role:'assistant', text:response}]);
+    setChatInput('');
+  };
+
+  const getColorForValue = (value) => {
+    const intensity = Math.round((value/100)*255);
+    return `rgb(${Math.round(255-intensity*0.5)},${Math.round(intensity*0.9)},${Math.round(intensity*0.3)})`;
+  };
+
+  const displayGrid = hoveredLayer ? layers.find(l=>l.id===hoveredLayer)?.rewards : calculateCombinedRewards();
+  const totalWeight = layers.filter(l=>l.visible).reduce((s,l)=>s+l.weight,0);
+
+  return (
+    <div style={{display:'flex', height:'100vh', backgroundColor:'#111827', color:'#f3f4f6'}}>
+      {/* Sidebar */}
+      <div style={{width:'288px', backgroundColor:'#1f2937', borderRight:'1px solid #374151', display:'flex', flexDirection:'column', overflow:'hidden'}}>
+        <div style={{padding:'12px', borderBottom:'1px solid #374151'}}>
+          <h2 style={{fontSize:'18px', fontWeight:'bold'}}>📊 Layers</h2>
+          <div style={{marginTop:'4px', fontSize:'12px', color: Math.abs(totalWeight-1.0)<0.001?'#34d399':'#fbbf24'}}>
+            Total: {totalWeight.toFixed(3)}
+          </div>
+        </div>
+
+        <div style={{flex:1, overflowY:'auto', padding:'12px', display:'flex', flexDirection:'column', gap:'8px'}}>
+          {layers.map(layer => (
+            <div key={layer.id} style={{padding:'8px', borderRadius:'6px', border:`1px solid ${hoveredLayer===layer.id?'#3b82f6':'#4b5563'}`, backgroundColor:layer.visible?'#374151':'#1f2937', opacity:layer.visible?1:0.6}}>
+              <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:'4px'}}>
+                <h3 style={{fontSize:'14px', fontWeight:'600', cursor:'pointer'}}
+                  onMouseEnter={()=>setHoveredLayer(layer.id)}
+                  onMouseLeave={()=>setHoveredLayer(null)}>
+                  {layer.name}
+                </h3>
+                <button onClick={()=>setLayers(layers.map(l=>l.id===layer.id?{...l,visible:!l.visible}:l))} style={{background:'none',border:'none',cursor:'pointer',fontSize:'14px'}}>
+                  {layer.visible?'👁️':'🚫'}
+                </button>
+              </div>
+              <p style={{fontSize:'11px', color:'#9ca3af', marginBottom:'8px'}}>{layer.description}</p>
+              <div style={{display:'flex', alignItems:'center', gap:'8px'}}>
+                <input type="range" min="0" max="1" step="0.01" value={layer.weight}
+                  onChange={e=>setLayers(layers.map(l=>l.id===layer.id?{...l,weight:parseFloat(e.target.value)}:l))}
+                  disabled={!layer.visible} style={{flex:1, opacity:layer.visible?1:0.3}} />
+                <span style={{fontSize:'11px', color:'#9ca3af', minWidth:'40px', textAlign:'right'}}>{Math.round(layer.weight*100)}%</span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{padding:'12px', borderTop:'1px solid #374151'}}>
+          <h3 style={{fontSize:'14px', fontWeight:'600', marginBottom:'8px'}}>Parameters</h3>
+          <div style={{fontSize:'12px', display:'flex', flexDirection:'column', gap:'8px'}}>
+            <div>
+              <label style={{color:'#9ca3af'}}>Discount: {discount.toFixed(2)}</label>
+              <input type="range" min="0.5" max="0.99" step="0.01" value={discount} onChange={e=>setDiscount(parseFloat(e.target.value))} style={{width:'100%'}} />
+            </div>
+            <div>
+              <label style={{color:'#9ca3af'}}>Speed: {(1000/speed).toFixed(1)} it/s</label>
+              <input type="range" min="100" max="2000" step="100" value={speed} onChange={e=>setSpeed(parseInt(e.target.value))} style={{width:'100%'}} />
+            </div>
+          </div>
+          {goalCell && <div style={{fontSize:'11px', color:'#9ca3af', marginTop:'8px'}}>🎯 [{goalCell.row}, {goalCell.col}]</div>}
+          {iteration>0 && <div style={{fontSize:'11px', marginTop:'8px'}}><span style={{color:'#60a5fa'}}>Iter: {iteration}</span>{converged&&<span style={{color:'#34d399', marginLeft:'8px'}}>✓ Converged</span>}</div>}
+          <div style={{display:'flex', gap:'8px', marginTop:'12px'}}>
+            <button onClick={()=>setIsRunning(!isRunning)} disabled={!goalCell}
+              style={{flex:1, padding:'8px', fontSize:'12px', borderRadius:'8px', fontWeight:'600', backgroundColor:'#7c3aed', color:'white', border:'none', cursor:goalCell?'pointer':'not-allowed', opacity:goalCell?1:0.5}}>
+              {isRunning?'⏸ Pause':'▶ Start'}
+            </button>
+            <button onClick={()=>{setIsRunning(false);setPolicy(null);setValueFunction(null);setIteration(0);setConverged(false);}}
+              style={{padding:'8px 12px', fontSize:'12px', borderRadius:'8px', fontWeight:'600', backgroundColor:'#4b5563', color:'white', border:'none', cursor:'pointer'}}>
+              ↻
+            </button>
+          </div>
+        </div>
+
+        <div style={{padding:'12px', borderTop:'1px solid #374151', display:'flex', flexDirection:'column', height:'220px'}}>
+          <h3 style={{fontSize:'14px', fontWeight:'600', marginBottom:'8px'}}>💬 AI Assistant</h3>
+          <div style={{flex:1, overflowY:'auto', marginBottom:'8px', padding:'8px', backgroundColor:'#111827', borderRadius:'6px', fontSize:'12px', display:'flex', flexDirection:'column', gap:'8px'}}>
+            {chatHistory.map((msg,idx)=>(
+              <div key={idx} style={{display:'flex', justifyContent:msg.role==='user'?'flex-end':'flex-start'}}>
+                <div style={{maxWidth:'80%', padding:'4px 10px', borderRadius:'8px', backgroundColor:msg.role==='user'?'#2563eb':'#374151', color:'white'}}>
+                  {msg.text}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div style={{display:'flex', gap:'8px'}}>
+            <input type="text" value={chatInput} onChange={e=>setChatInput(e.target.value)}
+              onKeyDown={e=>{if(e.key==='Enter')handleChat();}}
+              placeholder="Add parks layer"
+              style={{flex:1, padding:'4px 8px', fontSize:'12px', backgroundColor:'#374151', border:'1px solid #4b5563', borderRadius:'4px', color:'white'}} />
+            <button onClick={handleChat} style={{padding:'4px 12px', fontSize:'12px', backgroundColor:'#2563eb', color:'white', border:'none', borderRadius:'4px', cursor:'pointer', fontWeight:'bold'}}>Send</button>
+          </div>
+        </div>
+      </div>
+
+      {/* Main grid */}
+      <div style={{flex:1, display:'flex', alignItems:'center', justifyContent:'center', padding:'8px', overflow:'auto'}}>
+        <div style={{textAlign:'center'}}>
+          <h1 style={{fontSize:'20px', fontWeight:'bold', marginBottom:'4px'}}>
+            {hoveredLayer ? layers.find(l=>l.id===hoveredLayer)?.name+' Layer' : 'Combined MDP'}
+          </h1>
+          <p style={{fontSize:'12px', color:'#9ca3af', marginBottom:'8px'}}>
+            {goalCell ? (converged?'Converged!':isRunning?'Solving...':'Click Start') : 'Click cell for goal'}
+          </p>
+          <div style={{display:'inline-block', backgroundColor:'#374151', padding:'4px', borderRadius:'8px', transform:'scale(0.85)', transformOrigin:'top center'}}>
+            {displayGrid && displayGrid.map((row,i)=>(
+              <div key={i} style={{display:'flex', gap:'2px', marginBottom:'2px'}}>
+                {row.map((value,j)=>(
+                  <div key={i+'-'+j}
+                    style={{width:'48px', height:'48px', display:'flex', alignItems:'center', justifyContent:'center', fontSize:'12px', borderRadius:'4px', cursor:'pointer', backgroundColor:getColorForValue(value)}}
+                    onClick={()=>{
+                      if (goalCell&&(goalCell.row!==i||goalCell.col!==j)) {
+                        setPolicy(null);setValueFunction(null);setIteration(0);setConverged(false);setIsRunning(false);
+                      }
+                      setGoalCell({row:i,col:j});
+                    }}>
+                    {goalCell&&goalCell.row===i&&goalCell.col===j ? '🎯' :
+                     policy&&policy[i]&&policy[i][j]&&policy[i][j]!=='goal' ?
+                     <span style={{fontSize:'16px', color:'white', fontWeight:'bold'}}>{policy[i][j]}</span> :
+                     Math.round(value)}
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+          <div style={{marginTop:'8px', display:'flex', justifyContent:'center', gap:'16px', fontSize:'12px'}}>
+            {[['Low',0],['Med',50],['High',100]].map(([label,val])=>(
+              <div key={label} style={{display:'flex', alignItems:'center', gap:'4px'}}>
+                <div style={{width:'16px', height:'16px', borderRadius:'3px', backgroundColor:getColorForValue(val)}}></div>
+                <span>{label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+ReactDOM.render(<MultiGridMDP />, document.getElementById('root'));
+</script>
+</body>
+</html>
