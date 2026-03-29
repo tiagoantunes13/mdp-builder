@@ -76,8 +76,10 @@ const MultiGridMDP = () => {
   const [speed, setSpeed] = useState(1000);
   const [chatInput, setChatInput] = useState('');
   const [chatHistory, setChatHistory] = useState([
-    { role:'assistant', text:'Hello! Try: Add a parks layer with 15% weight' }
+    { role:'assistant', text:'Hello! I can help you build your MDP. Try asking me to add layers, change weights, set goals, or control the solver.' }
   ]);
+  const [isLoading, setIsLoading] = useState(false);
+  const chatEndRef = useRef(null);
   const iterationRef = useRef(null);
 
   const calculateCombinedRewards = () => {
@@ -167,30 +169,117 @@ const MultiGridMDP = () => {
     return () => { if (iterationRef.current) clearTimeout(iterationRef.current); };
   }, [isRunning, iteration, valueFunction, policy, goalCell, discount, speed, converged]);
 
-  const handleChat = () => {
-    if (!chatInput.trim()) return;
-    const newHistory = [...chatHistory, {role:'user', text:chatInput}];
-    const lower = chatInput.toLowerCase();
-    let response = '';
-    if (lower.includes('add')&&lower.includes('layer')) {
-      const weightMatch = lower.match(/(\d+)%/);
-      const weight = weightMatch ? parseFloat(weightMatch[1])/100 : 0.1;
-      let name='Custom';
-      if (lower.includes('park')) name='Parks';
-      else if (lower.includes('residential')) name='Residential';
-      else if (lower.includes('commercial')) name='Commercial';
-      const newLayer = { id:Math.max(...layers.map(l=>l.id))+1, name, weight, description:name, rewards:generateMockRewards(name.toLowerCase()), visible:true };
-      const visibleLayers = layers.filter(l=>l.visible);
-      const totalW = visibleLayers.reduce((s,l)=>s+l.weight,0);
-      const scaleFactor = (1-weight)/totalW;
-      const adjustedLayers = layers.map(l=>({...l, weight:l.visible?l.weight*scaleFactor:l.weight}));
-      setLayers([...adjustedLayers, newLayer]);
-      response = 'Added '+name+' layer with '+Math.round(weight*100)+'% weight';
-    } else {
-      response = 'Try: Add a parks layer with 15% weight';
+  useEffect(() => {
+    if (chatEndRef.current) chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
+  }, [chatHistory]);
+
+  const executeAction = (action) => {
+    switch (action.tool) {
+      case 'add_layer': {
+        const weight = Math.max(0, Math.min(1, action.args.weight));
+        const newLayer = {
+          id: Math.max(...layers.map(l => l.id)) + 1,
+          name: action.args.name,
+          weight,
+          description: action.args.name,
+          rewards: generateMockRewards(action.args.name.toLowerCase()),
+          visible: true
+        };
+        const visibleLayers = layers.filter(l => l.visible);
+        const totalW = visibleLayers.reduce((s, l) => s + l.weight, 0);
+        if (totalW > 0) {
+          const scaleFactor = (1 - weight) / totalW;
+          const adjustedLayers = layers.map(l => ({
+            ...l,
+            weight: l.visible ? l.weight * scaleFactor : l.weight
+          }));
+          setLayers([...adjustedLayers, newLayer]);
+        } else {
+          setLayers([...layers, newLayer]);
+        }
+        break;
+      }
+      case 'remove_layer':
+        setLayers(layers.filter(l => l.name.toLowerCase() !== action.args.name.toLowerCase()));
+        break;
+      case 'set_weight':
+        setLayers(layers.map(l =>
+          l.name.toLowerCase() === action.args.name.toLowerCase()
+            ? { ...l, weight: Math.max(0, Math.min(1, action.args.weight)) }
+            : l
+        ));
+        break;
+      case 'toggle_layer':
+        setLayers(layers.map(l =>
+          l.name.toLowerCase() === action.args.name.toLowerCase()
+            ? { ...l, visible: action.args.visible }
+            : l
+        ));
+        break;
+      case 'set_goal':
+        setGoalCell({ row: action.args.row, col: action.args.col });
+        break;
+      case 'set_discount':
+        setDiscount(Math.max(0.5, Math.min(0.99, action.args.value)));
+        break;
+      case 'start_solver':
+        setIsRunning(true);
+        break;
+      case 'stop_solver':
+        setIsRunning(false);
+        break;
+      case 'reset_solver':
+        setIsRunning(false);
+        setPolicy(null);
+        setValueFunction(null);
+        setIteration(0);
+        setConverged(false);
+        break;
     }
-    setChatHistory([...newHistory, {role:'assistant', text:response}]);
+  };
+
+  const handleChat = async () => {
+    if (!chatInput.trim() || isLoading) return;
+    const userMessage = { role: 'user', text: chatInput };
+    const updatedHistory = [...chatHistory, userMessage];
+    setChatHistory(updatedHistory);
     setChatInput('');
+    setIsLoading(true);
+
+    try {
+      const response = await fetch('http://localhost:3001/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: updatedHistory.map(m => ({ role: m.role, text: m.text })),
+          appState: {
+            layers: layers.map(l => ({ name: l.name, weight: l.weight, visible: l.visible })),
+            goalCell,
+            isRunning,
+            iteration,
+            converged,
+            discount
+          }
+        })
+      });
+
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.error || 'Server error');
+      }
+
+      const data = await response.json();
+
+      if (data.actions) {
+        data.actions.forEach(action => executeAction(action));
+      }
+
+      setChatHistory(prev => [...prev, { role: 'assistant', text: data.text }]);
+    } catch (error) {
+      setChatHistory(prev => [...prev, { role: 'assistant', text: 'Error: ' + error.message }]);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const getColorForValue = (value) => {
@@ -272,13 +361,25 @@ const MultiGridMDP = () => {
                 </div>
               </div>
             ))}
+            {isLoading && (
+              <div style={{display:'flex', justifyContent:'flex-start'}}>
+                <div style={{padding:'4px 10px', borderRadius:'8px', backgroundColor:'#374151', color:'#9ca3af'}}>
+                  Thinking...
+                </div>
+              </div>
+            )}
+            <div ref={chatEndRef} />
           </div>
           <div style={{display:'flex', gap:'8px'}}>
             <input type="text" value={chatInput} onChange={e=>setChatInput(e.target.value)}
               onKeyDown={e=>{if(e.key==='Enter')handleChat();}}
-              placeholder="Add parks layer"
-              style={{flex:1, padding:'4px 8px', fontSize:'12px', backgroundColor:'#374151', border:'1px solid #4b5563', borderRadius:'4px', color:'white'}} />
-            <button onClick={handleChat} style={{padding:'4px 12px', fontSize:'12px', backgroundColor:'#2563eb', color:'white', border:'none', borderRadius:'4px', cursor:'pointer', fontWeight:'bold'}}>Send</button>
+              placeholder={isLoading ? 'Thinking...' : 'Ask me anything...'}
+              disabled={isLoading}
+              style={{flex:1, padding:'4px 8px', fontSize:'12px', backgroundColor:'#374151', border:'1px solid #4b5563', borderRadius:'4px', color:'white', opacity:isLoading?0.5:1}} />
+            <button onClick={handleChat} disabled={isLoading}
+              style={{padding:'4px 12px', fontSize:'12px', backgroundColor:isLoading?'#4b5563':'#2563eb', color:'white', border:'none', borderRadius:'4px', cursor:isLoading?'not-allowed':'pointer', fontWeight:'bold'}}>
+              {isLoading ? '...' : 'Send'}
+            </button>
           </div>
         </div>
       </div>
